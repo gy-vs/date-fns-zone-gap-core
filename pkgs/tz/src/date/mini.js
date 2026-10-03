@@ -28,9 +28,10 @@ export class TZDateMini extends Date {
       } else if (args[0] instanceof Date) {
         this.setTime(+args[0]);
       } else {
-        this.setTime(+new Date(...args));
-        adjustToSystemTZ(this, NaN);
-        syncToInternal(this);
+        // Date components are wall-clock values in the target time zone.
+        // Resolve them directly against the zone instead of going through the
+        // system time zone, whose own DST transitions used to skew the result.
+        syncFromWallTime(this, Date.UTC(...args));
       }
     }
   }
@@ -128,161 +129,116 @@ function syncToInternal(date) {
  * @param {Date} date - The date to sync
  */
 function syncFromInternal(date) {
-  // First we transpose the internal values
-  Date.prototype.setFullYear.call(
-    date,
-    date.internal.getUTCFullYear(),
-    date.internal.getUTCMonth(),
-    date.internal.getUTCDate(),
-  );
-  Date.prototype.setHours.call(
-    date,
-    date.internal.getUTCHours(),
-    date.internal.getUTCMinutes(),
-    date.internal.getUTCSeconds(),
-    date.internal.getUTCMilliseconds(),
-  );
-
-  // Now we have to adjust the date to the system time zone
-  adjustToSystemTZ(date);
+  // The internal date keeps the wall-clock components of the target time zone
+  // in its UTC fields. Historical offsets may carry sub-minute seconds
+  // (e.g. Asia/Singapore +06:55:25 in 1900); align the wall components to the
+  // whole-minute offset before resolving. Only the target zone is consulted,
+  // so system-zone seconds never leak in. `syncToInternal` restores the
+  // seconds on the internal representation afterwards.
+  const seconds = Math.round(-tzOffset(date.timeZone, date.internal) * 60) % 60;
+  syncFromWallTime(date, +date.internal + seconds * 1000);
 }
 
 /**
- * Function adjusts the date to the system time zone. It uses the time zone
- * differences to calculate the offset and adjust the date.
+ * Resolve wall-clock components into a timestamp and sync both the date and
+ * its internal representation.
  *
- * @param {Date} date - Date to adjust
+ * @param {Date} date - The TZDate instance to sync
+ * @param {number} utcWall - Wall-clock components as a UTC timestamp
  */
-function adjustToSystemTZ(date) {
-  // Save the time zone offset before all the adjustments
-  const baseOffset = tzOffset(date.timeZone, date);
-  // Remove the seconds offset
-  // use Math.floor for negative GMT timezones and Math.ceil for positive GMT timezones.
-  const offset =
-    baseOffset > 0 ? Math.floor(baseOffset) : Math.ceil(baseOffset);
-  //#region System DST adjustment
+function syncFromWallTime(date, utcWall) {
+  Date.prototype.setTime.call(date, resolveWallTime(date.timeZone, utcWall));
+  syncToInternal(date);
+}
 
-  // The biggest problem with using the system time zone is that when we create
-  // a date from internal values stored in UTC, the system time zone might end
-  // up on the DST hour:
-  //
-  //   $ TZ=America/New_York node
-  //   > new Date(2020, 2, 8, 1).toString()
-  //   'Sun Mar 08 2020 01:00:00 GMT-0500 (Eastern Standard Time)'
-  //   > new Date(2020, 2, 8, 2).toString()
-  //   'Sun Mar 08 2020 03:00:00 GMT-0400 (Eastern Daylight Time)'
-  //   > new Date(2020, 2, 8, 3).toString()
-  //   'Sun Mar 08 2020 03:00:00 GMT-0400 (Eastern Daylight Time)'
-  //   > new Date(2020, 2, 8, 4).toString()
-  //   'Sun Mar 08 2020 04:00:00 GMT-0400 (Eastern Daylight Time)'
-  //
-  // Here we get the same hour for both 2 and 3, because the system time zone
-  // has DST beginning at 8 March 2020, 2 a.m. and jumps to 3 a.m. So we have
-  // to adjust the internal date to reflect that.
-  //
-  // However we want to adjust only if that's the DST hour the change happenes,
-  // not the hour where DST moves to.
+/**
+ * Resolve wall-clock components of a time zone to a UTC timestamp.
+ *
+ * The wall time is passed as a UTC timestamp (`utcWall`) carrying the same
+ * calendar components as the wall time (e.g. 02:30 in America/New_York is
+ * passed as `Date.UTC(year, month, day, 2, 30)`).
+ *
+ * Resolution follows the native `Date` rules:
+ *
+ * - an unambiguous wall time maps to its unique instant;
+ * - a spring-forward gap (a missing local time) is forward-shifted past the
+ *   gap (New York 02:30 -> 03:30). The resulting instant is obtained with the
+ *   pre-transition offset, which lands on the post-transition wall clock;
+ * - a fall-back overlap (a repeated local time) resolves to the first
+ *   occurrence (the earlier instant, on the pre-transition side).
+ *
+ * @param {string | undefined} timeZone - IANA time zone name
+ * @param {number} utcWall - Wall-clock components as a UTC timestamp
+ *
+ * @returns {number} Resolved UTC timestamp in milliseconds
+ */
+function resolveWallTime(timeZone, utcWall) {
+  if (isNaN(utcWall)) return NaN;
 
-  // We calculate the previous hour to see if the time zone offset has changed
-  // and we have landed on the DST hour.
-  const prevHour = new Date(+date);
-  // We use UTC methods here as we don't want to land on the same hour again
-  // in case of DST.
-  prevHour.setUTCHours(prevHour.getUTCHours() - 1);
+  // Primary candidate: interpret the wall time with the offset (whole minutes)
+  // Intl reports at the nominal instant. For ordinary times this is the
+  // answer. Intl resolves fall-back overlaps to the second occurrence and
+  // spring-forward gaps to the post-transition side, so the ambiguous cases
+  // need the checks below. Sub-minute offset seconds are handled by callers.
+  const off0 = tzOffset(timeZone, new Date(utcWall));
+  const t0 = utcWall - off0 * 60000;
 
-  // Calculate if we are on the system DST hour.
-  const systemOffset = -new Date(+date).getTimezoneOffset();
-  const prevHourSystemOffset = -new Date(+prevHour).getTimezoneOffset();
-  const systemDSTChange = systemOffset - prevHourSystemOffset;
-  // Detect the DST shift. System DST change will occur both on
-  const dstShift =
-    Date.prototype.getHours.apply(date) !== date.internal.getUTCHours();
+  // Probe both sides of the candidate to discover the neighbouring offset
+  // regime. Three hours safely straddles a single DST transition (gaps and
+  // overlaps last at most one hour) without reaching another transition.
+  // Collecting each side separately matters right next to a transition
+  // (e.g. :45 zones such as Pacific/Chatham).
+  const PROBE = 3 * 60 * 60000;
+  const offBefore = tzOffset(timeZone, new Date(t0 - PROBE));
+  const offAfter = tzOffset(timeZone, new Date(t0 + PROBE));
 
-  // Move the internal date when we are on the system DST hour.
-  if (systemDSTChange && dstShift)
-    date.internal.setUTCMinutes(
-      date.internal.getUTCMinutes() + systemDSTChange,
-    );
+  const candidates = [t0];
+  if (offBefore !== off0) candidates.push(utcWall - offBefore * 60000);
+  if (offAfter !== off0) candidates.push(utcWall - offAfter * 60000);
 
-  //#endregion
+  // Keep candidates whose instant actually displays the requested wall time.
+  const matching = candidates.filter((candidate) =>
+    wallMatches(timeZone, candidate, utcWall),
+  );
 
-  //#region System diff adjustment
-
-  // Now we need to adjust the date, since we just applied internal values.
-  // We need to calculate the difference between the system and date time zones
-  // and apply it to the date.
-
-  const offsetDiff = systemOffset - offset;
-  if (offsetDiff)
-    Date.prototype.setUTCMinutes.call(
-      date,
-      Date.prototype.getUTCMinutes.call(date) + offsetDiff,
-    );
-
-  //#endregion
-
-  //#region Seconds System diff adjustment
-
-  const systemDate = new Date(+date);
-  // Set the UTC seconds to 0 to isolate the timezone offset in seconds.
-  systemDate.setUTCSeconds(0);
-  // For negative systemOffset, invert the seconds.
-  const systemSecondsOffset =
-    systemOffset > 0
-      ? systemDate.getSeconds()
-      : (systemDate.getSeconds() - 60) % 60;
-
-  // Calculate the seconds offset based on the timezone offset.
-  const secondsOffset = Math.round(-(tzOffset(date.timeZone, date) * 60)) % 60;
-
-  if (secondsOffset || systemSecondsOffset) {
-    date.internal.setUTCSeconds(date.internal.getUTCSeconds() + secondsOffset);
-    Date.prototype.setUTCSeconds.call(
-      date,
-      Date.prototype.getUTCSeconds.call(date) +
-        secondsOffset +
-        systemSecondsOffset,
-    );
+  if (matching.length) {
+    // An overlap yields two matching instants (take the earlier/first one);
+    // otherwise the unique match is the answer.
+    return matching.length > 1 ? Math.min(...matching) : matching[0];
   }
 
-  //#endregion
-
-  //#region Post-adjustment DST fix
-
-  const postBaseOffset = tzOffset(date.timeZone, date);
-  // Remove the seconds offset
-  // use Math.floor for negative GMT timezones and Math.ceil for positive GMT timezones.
-  const postOffset =
-    postBaseOffset > 0 ? Math.floor(postBaseOffset) : Math.ceil(postBaseOffset);
-  const postSystemOffset = -new Date(+date).getTimezoneOffset();
-  const postOffsetDiff = postSystemOffset - postOffset;
-  const offsetChanged = postOffset !== offset;
-  const postDiff = postOffsetDiff - offsetDiff;
-
-  if (offsetChanged && postDiff) {
-    Date.prototype.setUTCMinutes.call(
-      date,
-      Date.prototype.getUTCMinutes.call(date) + postDiff,
-    );
-
-    // Now we need to check if got offset change during the post-adjustment.
-    // If so, we also need both dates to reflect that.
-
-    const newBaseOffset = tzOffset(date.timeZone, date);
-    // Remove the seconds offset
-    // use Math.floor for negative GMT timezones and Math.ceil for positive GMT timezones.
-    const newOffset =
-      newBaseOffset > 0 ? Math.floor(newBaseOffset) : Math.ceil(newBaseOffset);
-    const offsetChange = postOffset - newOffset;
-
-    if (offsetChange) {
-      date.internal.setUTCMinutes(date.internal.getUTCMinutes() + offsetChange);
-      Date.prototype.setUTCMinutes.call(
-        date,
-        Date.prototype.getUTCMinutes.call(date) + offsetChange,
-      );
-    }
+  // No candidate reproduces the wall time: spring-forward gap. Native Date
+  // forward-shifts the wall time by the size of the jump, which is the instant
+  // obtained with the pre-transition offset (New York 02:30 after a one-hour
+  // jump lands on the 03:30 instant; works for :30/:45 zones too).
+  if (offBefore !== offAfter) {
+    return utcWall - Math.min(offBefore, offAfter) * 60000;
   }
+  return t0;
+}
 
-  //#endregion
+/**
+ * Check whether the given instant displays the same wall-clock components in
+ * the time zone as `utcWall` carries as UTC.
+ *
+ * @param {string | undefined} timeZone - IANA time zone name
+ * @param {number} instant - UTC timestamp in milliseconds
+ * @param {number} utcWall - Expected wall-clock components as a UTC timestamp
+ *
+ * @returns {boolean} True when the components match
+ */
+function wallMatches(timeZone, instant, utcWall) {
+  const local = new Date(
+    instant + tzOffset(timeZone, new Date(instant)) * 60000,
+  );
+  const wall = new Date(utcWall);
+  return (
+    local.getUTCFullYear() === wall.getUTCFullYear() &&
+    local.getUTCMonth() === wall.getUTCMonth() &&
+    local.getUTCDate() === wall.getUTCDate() &&
+    local.getUTCHours() === wall.getUTCHours() &&
+    local.getUTCMinutes() === wall.getUTCMinutes() &&
+    local.getUTCSeconds() === wall.getUTCSeconds() &&
+    local.getUTCMilliseconds() === wall.getUTCMilliseconds()
+  );
 }
