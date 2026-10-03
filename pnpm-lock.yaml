@@ -225,6 +225,9 @@ importers:
       '@date-fns/dev':
         specifier: workspace:*
         version: link:../dev
+      '@date-fns/utc':
+        specifier: workspace:*
+        version: link:../utc
       '@parcel/watcher':
         specifier: ^2.4.1
         version: 2.5.1

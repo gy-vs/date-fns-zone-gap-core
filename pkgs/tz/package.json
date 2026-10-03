@@ -130,6 +130,7 @@
     "@babel/preset-env": "^7.28.0",
     "@babel/preset-typescript": "^7.27.1",
     "@date-fns/dev": "workspace:*",
+    "@date-fns/utc": "workspace:*",
     "@parcel/watcher": "^2.4.1",
     "@swc/core": "^1.4.13",
     "@typescript/native-preview": "7.0.0-dev.20260421.2",
